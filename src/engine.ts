@@ -125,6 +125,22 @@ export class KittenTTSEngine {
   private timings: Map<string, number> = new Map();
   private _stageStart = 0;
 
+  /** GPU profiling via timestamp-query: when true (and the feature is available),
+   *  records real GPU execution time per compute pass, grouped by pipeline name. */
+  public profileGPU = false;
+  private hasTimestamp = false;
+  private tsQuerySet: GPUQuerySet | null = null;
+  private tsResolveBuffer: GPUBuffer | null = null;
+  private readonly tsCapacity = 4096; // max queries per set (spec cap); 2 per pass → 2048 passes/flush
+  private tsCursor = 0;               // next free query index within the current shared encoder
+  private tsPassNames: string[] = []; // pass i → pipeline name, for the current shared encoder
+  private tsDropped = 0;              // passes that overflowed capacity (not timed)
+  private tsReadbackQueue: { staging: GPUBuffer; names: string[] }[] = []; // resolved, awaiting map after submit
+  private tsPending: Promise<void>[] = []; // in-flight timestamp readbacks
+  private gpuTimings: Map<string, { ns: number; count: number }> = new Map();
+  /** Per-shader GPU timing report from the last generate(): total ms + dispatch count. */
+  public lastGPUTimings: { name: string; ms: number; count: number }[] = [];
+
   constructor(config: KittenConfig = DEFAULT_CONFIG) {
     this.config = config;
   }
@@ -199,12 +215,22 @@ export class KittenTTSEngine {
     const maxSize = Math.min(256 * 1024 * 1024, adapterLimits.maxBufferSize);
     console.log(`[KittenTTS] Adapter limits: maxStorageBuffer=${maxBuf}, maxBuffer=${maxSize}`);
 
+    // Request timestamp-query when available so we can measure real GPU time per pass.
+    // Not all adapters expose it (notably Safari currently gates it); degrade gracefully.
+    const requiredFeatures: GPUFeatureName[] = [];
+    if (adapter.features.has('timestamp-query')) {
+      requiredFeatures.push('timestamp-query');
+      this.hasTimestamp = true;
+    }
+
     this.device = await adapter.requestDevice({
+      requiredFeatures,
       requiredLimits: {
         maxStorageBufferBindingSize: maxBuf,
         maxBufferSize: maxSize,
       },
     });
+    if (this.hasTimestamp) console.log('[KittenTTS] timestamp-query available — per-shader GPU timing enabled');
 
     // Handle device loss gracefully
     this.device.lost.then((info) => {
@@ -1488,6 +1514,7 @@ export class KittenTTSEngine {
     const finalWaveform = waveformData.slice(trimStart, trimEnd);
 
     await this.endStage('iSTFT synthesis (GPU)');
+    await this.flushGPUTimings();
     this.printTimings();
 
     console.log(`[KittenTTS] Waveform: ${finalWaveform.length} samples (${(finalWaveform.length / 24000).toFixed(2)}s)`);
@@ -1719,7 +1746,25 @@ export class KittenTTSEngine {
 
     // Each dispatch gets its own compute pass for proper memory barriers.
     // Without separate passes, dispatch B can read stale/zero data from dispatch A's output.
-    const pass = this.sharedEncoder.beginComputePass({ label: pipelineName });
+    const passDesc: GPUComputePassDescriptor = { label: pipelineName };
+
+    // Attach GPU timestamps (begin/end of pass) when profiling and there's room in the set.
+    if (this.profileGPU && this.hasTimestamp) {
+      const querySet = this.ensureTimestampSet();
+      if (this.tsCursor + 2 <= this.tsCapacity) {
+        passDesc.timestampWrites = {
+          querySet,
+          beginningOfPassWriteIndex: this.tsCursor,
+          endOfPassWriteIndex: this.tsCursor + 1,
+        };
+        this.tsCursor += 2;
+        this.tsPassNames.push(pipelineName);
+      } else {
+        this.tsDropped++;
+      }
+    }
+
+    const pass = this.sharedEncoder.beginComputePass(passDesc);
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
@@ -1732,12 +1777,110 @@ export class KittenTTSEngine {
     this.deferredDestroys.push(buffer);
   }
 
+  /** Lazily create the timestamp query set + resolve buffer (once, on first profiled dispatch). */
+  private ensureTimestampSet(): GPUQuerySet {
+    if (!this.tsQuerySet) {
+      this.tsQuerySet = this.device.createQuerySet({
+        type: 'timestamp',
+        count: this.tsCapacity,
+        label: 'gpu_timestamps',
+      });
+      this.tsResolveBuffer = this.device.createBuffer({
+        size: this.tsCapacity * 8, // u64 per query
+        usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+        label: 'gpu_timestamps_resolve',
+      });
+    }
+    return this.tsQuerySet;
+  }
+
+  /** Encode timestamp resolution into the still-open shared encoder. Stashes the staging
+   *  buffer for readback AFTER submit — mapAsync must NOT be called before the encoder that
+   *  references the staging buffer is submitted, or Dawn rejects the submit. */
+  private resolveTimestamps(): void {
+    if (!this.profileGPU || !this.hasTimestamp || this.tsCursor === 0 || !this.sharedEncoder) return;
+
+    const querySet = this.tsQuerySet!;
+    const resolveBuffer = this.tsResolveBuffer!;
+    const queryCount = this.tsCursor;            // queries written this batch
+    const names = this.tsPassNames;              // one name per pass (2 queries)
+
+    // Copy the resolved values into a fresh mappable staging buffer within this encoder.
+    const staging = this.device.createBuffer({
+      size: queryCount * 8,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      label: 'gpu_timestamps_staging',
+    });
+    this.sharedEncoder.resolveQuerySet(querySet, 0, queryCount, resolveBuffer, 0);
+    this.sharedEncoder.copyBufferToBuffer(resolveBuffer, 0, staging, 0, queryCount * 8);
+
+    // Reset per-batch state; a new batch starts fresh on the next dispatch.
+    this.tsCursor = 0;
+    this.tsPassNames = [];
+    this.tsReadbackQueue.push({ staging, names });
+  }
+
+  /** After the shared encoder is submitted, kick off async readback of each stashed
+   *  staging buffer and accumulate GPU nanoseconds per pipeline name. */
+  private drainTimestampReadbacks(): void {
+    if (this.tsReadbackQueue.length === 0) return;
+    const queue = this.tsReadbackQueue;
+    this.tsReadbackQueue = [];
+    for (const { staging, names } of queue) {
+      this.tsPending.push((async () => {
+        await staging.mapAsync(GPUMapMode.READ);
+        const ts = new BigUint64Array(staging.getMappedRange().slice(0));
+        staging.unmap();
+        staging.destroy();
+        for (let i = 0; i < names.length; i++) {
+          const begin = ts[i * 2];
+          const end = ts[i * 2 + 1];
+          if (end <= begin) continue; // unwritten / non-monotonic — skip
+          const ns = Number(end - begin);
+          const entry = this.gpuTimings.get(names[i]) ?? { ns: 0, count: 0 };
+          entry.ns += ns;
+          entry.count++;
+          this.gpuTimings.set(names[i], entry);
+        }
+      })());
+    }
+  }
+
+  /** Await all in-flight timestamp readbacks and build the sorted per-shader report. */
+  private async flushGPUTimings(): Promise<void> {
+    if (!this.profileGPU || !this.hasTimestamp) return;
+    await Promise.all(this.tsPending);
+    this.tsPending = [];
+
+    this.lastGPUTimings = [...this.gpuTimings.entries()]
+      .map(([name, { ns, count }]) => ({ name, ms: ns / 1e6, count }))
+      .sort((a, b) => b.ms - a.ms);
+
+    if (this.lastGPUTimings.length > 0) {
+      console.log('\n[KittenTTS] ── GPU Time per Shader (timestamp-query) ──');
+      let total = 0;
+      for (const { name, ms, count } of this.lastGPUTimings) {
+        total += ms;
+        console.log(`  ${name.padEnd(32)} ${ms.toFixed(2).padStart(9)} ms   (${count}×, ${(ms / count).toFixed(3)} ms/dispatch)`);
+      }
+      console.log(`  ${'─'.repeat(58)}`);
+      console.log(`  ${'TOTAL GPU'.padEnd(32)} ${total.toFixed(2).padStart(9)} ms`);
+      if (this.tsDropped > 0) console.log(`  (${this.tsDropped} passes exceeded query capacity and were not timed)`);
+    }
+    this.gpuTimings.clear();
+    this.tsDropped = 0;
+  }
+
   /** Flush the shared encoder — submit all batched dispatches and destroy deferred buffers. */
   private flushSharedEncoder(): void {
+    // Resolve timestamps into the encoder before we finish it.
+    this.resolveTimestamps();
     if (this.sharedEncoder) {
       this.device.queue.submit([this.sharedEncoder.finish()]);
       this.sharedEncoder = null;
     }
+    // Only now that the encoder is submitted is it safe to map the staging buffers.
+    this.drainTimestampReadbacks();
     // Now safe to destroy deferred buffers (GPU has captured their contents)
     for (const buf of this.deferredDestroys) {
       buf.destroy();
@@ -2904,7 +3047,8 @@ export class KittenTTSEngine {
       ],
     });
 
-    this.dispatchSingle('instanceNorm', bindGroup, Math.ceil(channels / 256));
+    // One workgroup per channel; the 256 threads reduce over `length` cooperatively.
+    this.dispatchSingle('instanceNorm', bindGroup, channels);
   }
 
   private dispatchAdaIN(

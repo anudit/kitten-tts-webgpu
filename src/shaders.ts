@@ -223,32 +223,58 @@ struct Params {
 }
 @group(0) @binding(2) var<uniform> params: Params;
 
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let ch = gid.x;
-  if (ch >= params.channels) { return; }
+// One workgroup per channel; the 256 threads cooperatively reduce over the
+// channel's length via shared memory. (The old kernel used one *thread* per
+// channel, each looping over the full length 3× serially — leaving the GPU
+// almost entirely idle for long sequences.)
+const WG = 256u;
+var<workgroup> red: array<f32, WG>;
+var<workgroup> sh_mean: f32;
+var<workgroup> sh_inv_std: f32;
 
-  let offset = ch * params.length;
+@compute @workgroup_size(WG)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let ch = wid.x;
+  if (ch >= params.channels) { return; } // workgroup-uniform: safe with barriers
 
-  // Compute mean
-  var sum = 0.0;
-  for (var i = 0u; i < params.length; i++) {
-    sum += input[offset + i];
+  let tid = lid.x;
+  let L = params.length;
+  let base = ch * L;
+
+  // ── Pass 1: mean (strided partial sums → tree reduction) ──
+  var s = 0.0;
+  for (var i = tid; i < L; i += WG) { s += input[base + i]; }
+  red[tid] = s;
+  workgroupBarrier();
+  for (var stride = WG / 2u; stride > 0u; stride >>= 1u) {
+    if (tid < stride) { red[tid] += red[tid + stride]; }
+    workgroupBarrier();
   }
-  let mean = sum / f32(params.length);
+  if (tid == 0u) { sh_mean = red[0] / f32(L); }
+  workgroupBarrier();
+  let mean = sh_mean;
+  workgroupBarrier(); // all threads have read red[0]/sh_mean before we reuse red
 
-  // Compute variance
-  var var_sum = 0.0;
-  for (var i = 0u; i < params.length; i++) {
-    let diff = input[offset + i] - mean;
-    var_sum += diff * diff;
+  // ── Pass 2: variance from deviations (matches original formulation) ──
+  var vs = 0.0;
+  for (var i = tid; i < L; i += WG) {
+    let d = input[base + i] - mean;
+    vs += d * d;
   }
-  let variance = var_sum / f32(params.length);
-  let inv_std = 1.0 / sqrt(variance + params.eps);
+  red[tid] = vs;
+  workgroupBarrier();
+  for (var stride = WG / 2u; stride > 0u; stride >>= 1u) {
+    if (tid < stride) { red[tid] += red[tid + stride]; }
+    workgroupBarrier();
+  }
+  if (tid == 0u) { sh_inv_std = 1.0 / sqrt(red[0] / f32(L) + params.eps); }
+  workgroupBarrier();
+  let inv_std = sh_inv_std;
 
-  // Normalize (no scale/bias for instance norm in this model - AdaIN handles that)
-  for (var i = 0u; i < params.length; i++) {
-    output[offset + i] = (input[offset + i] - mean) * inv_std;
+  // ── Normalize (no scale/bias — AdaIN applies those downstream) ──
+  for (var i = tid; i < L; i += WG) {
+    output[base + i] = (input[base + i] - mean) * inv_std;
   }
 }
 `;
@@ -442,20 +468,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   if (out_ch >= params.out_channels) { return; }
 
+  let stride = params.stride;
+  let K = params.kernel_size;
+  let L_in = params.input_length;
+  let C_in = params.in_channels;
+
+  // ConvTranspose: out_pos = in_pos*stride + k - padding, so contributing taps
+  // satisfy (out_pos + padding - k) % stride == 0. Only K/stride of the K taps
+  // qualify, so step k by stride from the first valid tap instead of scanning
+  // all K taps with a modulo test (the old kernel wasted up to ~80% of iterations).
+  let op = out_pos + params.padding;   // always >= 0
+  let k0 = op % stride;                // k ≡ op (mod stride)
+
   var sum = 0.0;
-  for (var ic = 0u; ic < params.in_channels; ic++) {
-    for (var k = 0u; k < params.kernel_size; k++) {
-      // ConvTranspose: output[out_pos] += input[in_pos] * weight[ic, out_ch, k]
-      // where out_pos = in_pos * stride + k - padding
-      // so in_pos = (out_pos + padding - k) / stride
-      let numerator = i32(out_pos) + i32(params.padding) - i32(k);
-      if (numerator >= 0 && u32(numerator) % params.stride == 0u) {
-        let in_pos = u32(numerator) / params.stride;
-        if (in_pos < params.input_length) {
-          let w_idx = ic * params.out_channels * params.kernel_size + out_ch * params.kernel_size + k;
-          let in_idx = ic * params.input_length + in_pos;
-          sum += input[in_idx] * weight[w_idx];
-        }
+  for (var k = k0; k < K; k += stride) {
+    let num = i32(op) - i32(k);
+    if (num < 0) { break; }            // in_pos negative; larger k only more negative
+    let in_pos = u32(num) / stride;
+    if (in_pos < L_in) {
+      let w_col = out_ch * K + k;       // weight[ic, out_ch, k] = ic*C_out*K + w_col
+      for (var ic = 0u; ic < C_in; ic++) {
+        sum += input[ic * L_in + in_pos] * weight[ic * params.out_channels * K + w_col];
       }
     }
   }

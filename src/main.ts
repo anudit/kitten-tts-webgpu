@@ -312,6 +312,7 @@ async function loadModel() {
 
   engine = new KittenTTSEngine();
   engine.profile = true;
+  engine.profileGPU = true;
 
   try {
     await engine.init();
@@ -410,6 +411,17 @@ generateBtn.addEventListener('click', async () => {
       // Auto-open log on desktop only (the CSS transition from closed→open
       // triggers compositor layer allocation that crashes iOS Safari WebContent)
       if (!isMobile && !logContent.classList.contains('open')) logToggle.click();
+    }
+
+    // Log real GPU time per shader (from timestamp-query), hottest first
+    if (engine.lastGPUTimings.length > 0) {
+      log('── GPU Time per Shader ──');
+      const top = engine.lastGPUTimings.slice(0, 12);
+      const maxMs = Math.max(...top.map(t => t.ms));
+      for (const { name, ms, count } of top) {
+        const barLen = Math.max(1, Math.round((ms / Math.max(maxMs, 1)) * 20));
+        log(`  ${name}: ${ms.toFixed(1)}ms (${count}×) ${'█'.repeat(barLen)}`);
+      }
     }
 
     // Store for resize redraw (skip on mobile to save memory)
