@@ -210,6 +210,72 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
+// ── Conv1d (shared-memory weight tiling) ─────────────────────────────────────
+// One workgroup handles a single out_ch and a tile of 256 output positions. The
+// out_ch's weight row [C_in*K] is loaded into workgroup memory once and reused by
+// all 256 threads, instead of every thread re-reading it from global memory.
+// Dispatch: x = ceil(output_length / 256) tiles, y = out_channels.
+// The host only routes here when in_channels*kernel_size <= 4096 (the shared array
+// size); larger weight rows fall back to conv1dShader. Accumulation order matches
+// conv1dShader exactly (ic outer, k inner) → bit-identical results.
+export const conv1dTiledShader = /* wgsl */ `
+@group(0) @binding(0) var<storage, read> input: array<f32>;     // [C_in, L]
+@group(0) @binding(1) var<storage, read> weight: array<f32>;    // [C_out, C_in, K]
+@group(0) @binding(2) var<storage, read> bias: array<f32>;      // [C_out]
+@group(0) @binding(3) var<storage, read_write> output: array<f32>; // [C_out, L_out]
+
+struct Params {
+  in_channels: u32,
+  out_channels: u32,
+  kernel_size: u32,
+  input_length: u32,
+  output_length: u32,
+  padding: u32,
+  stride: u32,
+  dilation: u32,
+  use_bias: u32,
+}
+@group(0) @binding(4) var<uniform> params: Params;
+
+var<workgroup> w_tile: array<f32, 4096>; // holds one out_ch weight row [C_in*K]
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let out_ch = wid.y;
+  let row_size = params.in_channels * params.kernel_size;
+  let w_base = out_ch * row_size;
+
+  // Cooperatively load this out_ch's weight row into shared memory (all threads
+  // participate and reach the barrier uniformly, before any early return).
+  for (var i = lid.x; i < row_size; i += 256u) {
+    w_tile[i] = weight[w_base + i];
+  }
+  workgroupBarrier();
+
+  let out_pos = wid.x * 256u + lid.x;
+  if (out_pos >= params.output_length) { return; }
+
+  var sum = 0.0;
+  for (var ic = 0u; ic < params.in_channels; ic++) {
+    let in_base = ic * params.input_length;
+    let wt_base = ic * params.kernel_size;
+    for (var k = 0u; k < params.kernel_size; k++) {
+      let in_pos_raw = i32(out_pos * params.stride) + i32(k * params.dilation) - i32(params.padding);
+      if (in_pos_raw >= 0 && u32(in_pos_raw) < params.input_length) {
+        sum += input[in_base + u32(in_pos_raw)] * w_tile[wt_base + k];
+      }
+    }
+  }
+
+  if (params.use_bias != 0u) {
+    sum += bias[out_ch];
+  }
+
+  output[out_ch * params.output_length + out_pos] = sum;
+}
+`;
+
 // ── Instance Normalization ───────────────────────────────────────────────────
 
 export const instanceNormShader = /* wgsl */ `

@@ -8,7 +8,7 @@
 import { DEFAULT_CONFIG, type GpuTensor, type KittenConfig } from './types.js';
 import { OnnxParser, parseNpz, float16ToFloat32, dequantizeInt8, dequantizeUint8 } from './onnx.js';
 import {
-  embeddingShader, layerNormShader, matmulShader, conv1dShader,
+  embeddingShader, layerNormShader, matmulShader, conv1dShader, conv1dTiledShader,
   instanceNormShader, adainShader, adainRowMajorShader, convTranspose1dShader,
   depthwiseConvTranspose1dShader, resize1dShader,
   leakyReluShader, geluShader, softmaxShader, addShader, scaleShader,
@@ -2491,7 +2491,13 @@ export class KittenTTSEngine {
     dilation: number,
     useBias: boolean
   ): void {
-    const { bindGroupLayout } = this.pipelines.get('conv1d')!;
+    // Route to the shared-memory tiled kernel when the out_ch weight row fits in
+    // the 4096-float (16 KB) workgroup array; otherwise use the plain kernel.
+    // (w_tile size in conv1dTiledShader must match this threshold.)
+    const useTiled = inChannels * kernelSize <= 4096;
+    const pipelineName = useTiled ? 'conv1dTiled' : 'conv1d';
+
+    const { bindGroupLayout } = this.pipelines.get(pipelineName)!;
     const params = this.createUniformBuffer(
       new Uint32Array([inChannels, outChannels, kernelSize, inputLength, outputLength, padding, stride, dilation, useBias ? 1 : 0]),
       'conv1d_params'
@@ -2508,7 +2514,12 @@ export class KittenTTSEngine {
       ],
     });
 
-    this.dispatchSingle('conv1d', bindGroup, Math.ceil((outChannels * outputLength) / 256));
+    if (useTiled) {
+      // 2D grid: x = output-position tiles of 256, y = out_channels (one per workgroup).
+      this.dispatchSingle(pipelineName, bindGroup, Math.ceil(outputLength / 256), outChannels);
+    } else {
+      this.dispatchSingle(pipelineName, bindGroup, Math.ceil((outChannels * outputLength) / 256));
+    }
   }
 
   private dispatchTranspose(
@@ -3367,6 +3378,7 @@ export class KittenTTSEngine {
       layerNorm: layerNormShader,
       matmul: matmulShader,
       conv1d: conv1dShader,
+      conv1dTiled: conv1dTiledShader,
       instanceNorm: instanceNormShader,
       adain: adainShader,
       adainRowMajor: adainRowMajorShader,
